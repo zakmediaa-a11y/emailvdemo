@@ -1,3 +1,26 @@
+# SIMPLE DATABASE REPLACEMENT
+import pandas as pd
+import os
+
+def save_to_csv(result, batch_id=None, verification_type='manual'):
+    data = {
+        'email': [result.email],
+        'status': [result.status],
+        'syntax_valid': [result.syntax_valid],
+        'domain_exists': [result.domain_exists],
+        # ... add all other fields
+        'timestamp': [pd.Timestamp.now()]
+    }
+    
+    df = pd.DataFrame(data)
+    
+    # Save to CSV instead of database
+    if os.path.exists('verification_history.csv'):
+        df.to_csv('verification_history.csv', mode='a', header=False, index=False)
+    else:
+        df.to_csv('verification_history.csv', index=False)
+    
+    return True
 import re
 import dns.resolver
 import socket
