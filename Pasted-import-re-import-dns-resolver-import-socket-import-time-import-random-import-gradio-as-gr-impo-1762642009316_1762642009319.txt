@@ -1,0 +1,1035 @@
+import re
+import dns.resolver
+import socket
+import time
+import random
+import gradio as gr
+import pandas as pd
+from typing import List, Optional, Tuple, Dict
+from dataclasses import dataclass
+import io
+
+@dataclass
+class EmailVerificationResult:
+    email: str
+    status: str
+    syntax_valid: bool
+    domain_exists: bool
+    mx_records_exist: bool
+    smtp_verified: Optional[bool]
+    is_catch_all: Optional[bool]
+    is_disposable: bool
+    is_role_based: bool
+    is_free_provider: bool
+    mx_records: List[str]
+    details: List[str]
+    confidence_score: int
+    deliverable: bool
+
+class EmailVerifier:
+    def __init__(self):
+        self.disposable_domains = {
+            'tempmail.com', 'guerrillamail.com', 'mailinator.com', '10minutemail.com',
+            'throwaway.email', 'yopmail.com', 'temp-mail.org', 'getnada.com',
+            'trashmail.com', 'fakeinbox.com', 'maildrop.cc', 'sharklasers.com',
+        }
+        
+        self.role_prefixes = {
+            'admin', 'info', 'support', 'sales', 'contact', 'help', 'service',
+            'office', 'noreply', 'no-reply', 'webmaster', 'postmaster',
+        }
+        
+        self.free_providers = {
+            'gmail.com', 'yahoo.com', 'outlook.com', 'hotmail.com', 'aol.com',
+            'icloud.com', 'mail.com', 'protonmail.com', 'zoho.com',
+        }
+    
+    def validate_syntax(self, email: str) -> Tuple[bool, str]:
+        if not email or '@' not in email:
+            return False, "Missing @ symbol"
+        if email.count('@') > 1:
+            return False, "Multiple @ symbols"
+        
+        try:
+            local, domain = email.split('@')
+        except:
+            return False, "Invalid format"
+        
+        if not local or len(local) > 64:
+            return False, "Invalid local part length"
+        if local.startswith('.') or local.endswith('.'):
+            return False, "Local part cannot start/end with dot"
+        if '..' in local:
+            return False, "Consecutive dots"
+        if not domain or len(domain) > 255:
+            return False, "Invalid domain length"
+        
+        pattern = r'^[a-zA-Z0-9][a-zA-Z0-9._%+-]*@[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*\.[a-zA-Z]{2,}$'
+        if not re.match(pattern, email):
+            return False, "Invalid email format"
+        
+        return True, "Valid syntax"
+    
+    def check_domain_exists(self, domain: str) -> bool:
+        try:
+            socket.gethostbyname(domain)
+            return True
+        except:
+            return False
+    
+    def get_mx_records(self, domain: str) -> List[str]:
+        try:
+            mx_records = dns.resolver.resolve(domain, 'MX')
+            sorted_mx = sorted(mx_records, key=lambda x: x.preference)
+            return [str(r.exchange).rstrip('.') for r in sorted_mx]
+        except:
+            return []
+    
+    def smtp_verify(self, email: str, mx_host: str, timeout: int = 15) -> Tuple[Optional[bool], str]:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((mx_host, 25))
+            
+            banner = sock.recv(1024).decode('utf-8', errors='ignore')
+            if not banner.startswith('220'):
+                sock.close()
+                return None, f"Invalid banner"
+            
+            sock.send(b'EHLO verify.local\r\n')
+            time.sleep(0.5)
+            response = sock.recv(1024).decode('utf-8', errors='ignore')
+            
+            if not response.startswith('250'):
+                sock.send(b'HELO verify.local\r\n')
+                time.sleep(0.5)
+                response = sock.recv(1024).decode('utf-8', errors='ignore')
+                if not response.startswith('250'):
+                    sock.close()
+                    return None, f"HELO failed"
+            
+            sender = random.choice(['verify@gmail.com', 'check@yahoo.com'])
+            sock.send(f'MAIL FROM:<{sender}>\r\n'.encode())
+            time.sleep(0.5)
+            response = sock.recv(1024).decode('utf-8', errors='ignore')
+            
+            if not response.startswith('250'):
+                sock.close()
+                return None, f"MAIL FROM rejected"
+            
+            sock.send(f'RCPT TO:<{email}>\r\n'.encode())
+            time.sleep(0.5)
+            response = sock.recv(1024).decode('utf-8', errors='ignore')
+            
+            sock.send(b'QUIT\r\n')
+            sock.close()
+            
+            response_code = response[:3]
+            
+            if response_code in ['250', '251']:
+                return True, "Mailbox verified"
+            elif response_code in ['550', '551', '552', '553']:
+                return False, "Mailbox does not exist"
+            else:
+                return None, f"Inconclusive ({response_code})"
+                
+        except Exception as e:
+            return None, f"Error: {str(e)[:40]}"
+    
+    def check_catch_all(self, domain: str, mx_host: str) -> Optional[bool]:
+        random_local = f"nonexistent{random.randint(100000, 999999)}test{random.randint(1000, 9999)}"
+        random_email = f"{random_local}@{domain}"
+        try:
+            result, _ = self.smtp_verify(random_email, mx_host, timeout=10)
+            return result is True
+        except:
+            return None
+    
+    def is_disposable(self, domain: str) -> bool:
+        return domain.lower() in self.disposable_domains
+    
+    def is_role_based(self, email: str) -> bool:
+        local_part = email.split('@')[0].lower()
+        return local_part in self.role_prefixes
+    
+    def is_free_provider(self, domain: str) -> bool:
+        return domain.lower() in self.free_providers
+    
+    def calculate_confidence(self, result: 'EmailVerificationResult') -> int:
+        score = 0
+        if result.syntax_valid:
+            score += 10
+        if result.domain_exists:
+            score += 10
+        if result.mx_records_exist:
+            score += 20
+        if result.smtp_verified is True:
+            score += 50
+        elif result.smtp_verified is False:
+            return 0
+        if result.is_catch_all:
+            score -= 15
+        if result.is_disposable:
+            score = min(score, 30)
+        if result.is_role_based:
+            score -= 5
+        return max(0, min(100, score))
+    
+    def verify(self, email: str, check_smtp: bool = True, check_catch_all: bool = True) -> EmailVerificationResult:
+        email = email.strip().lower()
+        details = []
+        
+        syntax_valid, syntax_msg = self.validate_syntax(email)
+        if not syntax_valid:
+            return EmailVerificationResult(
+                email=email, status='INVALID', syntax_valid=False,
+                domain_exists=False, mx_records_exist=False, smtp_verified=None,
+                is_catch_all=None, is_disposable=False, is_role_based=False,
+                is_free_provider=False, mx_records=[], details=[syntax_msg],
+                confidence_score=0, deliverable=False
+            )
+        
+        domain = email.split('@')[1]
+        is_disposable = self.is_disposable(domain)
+        is_role_based = self.is_role_based(email)
+        is_free_provider = self.is_free_provider(domain)
+        
+        if is_disposable:
+            details.append("Disposable email")
+        if is_role_based:
+            details.append("Role-based address")
+        
+        domain_exists = self.check_domain_exists(domain)
+        if not domain_exists:
+            details.append("Domain does not exist")
+            return EmailVerificationResult(
+                email=email, status='INVALID', syntax_valid=True,
+                domain_exists=False, mx_records_exist=False, smtp_verified=None,
+                is_catch_all=None, is_disposable=is_disposable,
+                is_role_based=is_role_based, is_free_provider=is_free_provider,
+                mx_records=[], details=details, confidence_score=10, deliverable=False
+            )
+        
+        mx_records = self.get_mx_records(domain)
+        mx_records_exist = len(mx_records) > 0
+        
+        if not mx_records_exist:
+            details.append("No MX records")
+            return EmailVerificationResult(
+                email=email, status='INVALID', syntax_valid=True,
+                domain_exists=True, mx_records_exist=False, smtp_verified=None,
+                is_catch_all=None, is_disposable=is_disposable,
+                is_role_based=is_role_based, is_free_provider=is_free_provider,
+                mx_records=[], details=details, confidence_score=20, deliverable=False
+            )
+        
+        smtp_verified = None
+        if check_smtp:
+            smtp_verified, smtp_detail = self.smtp_verify(email, mx_records[0])
+            details.append(smtp_detail)
+        
+        is_catch_all = None
+        if check_catch_all and mx_records and smtp_verified is not False:
+            is_catch_all = self.check_catch_all(domain, mx_records[0])
+            if is_catch_all:
+                details.append("Catch-all domain")
+        
+        if smtp_verified is False:
+            status = 'INVALID'
+            deliverable = False
+        elif smtp_verified is True and not is_disposable:
+            status = 'VALID'
+            deliverable = True
+        elif is_disposable or is_catch_all:
+            status = 'RISKY'
+            deliverable = smtp_verified is True
+        else:
+            status = 'UNKNOWN'
+            deliverable = False
+        
+        result = EmailVerificationResult(
+            email=email, status=status, syntax_valid=syntax_valid,
+            domain_exists=domain_exists, mx_records_exist=mx_records_exist,
+            smtp_verified=smtp_verified, is_catch_all=is_catch_all,
+            is_disposable=is_disposable, is_role_based=is_role_based,
+            is_free_provider=is_free_provider, mx_records=mx_records,
+            details=details, confidence_score=0, deliverable=deliverable
+        )
+        
+        result.confidence_score = self.calculate_confidence(result)
+        return result
+    
+    def generate_email_patterns(self, first_name: str, last_name: str, domain: str) -> List[Dict[str, str]]:
+        """Generate all possible email patterns for a name"""
+        first = first_name.lower().strip()
+        last = last_name.lower().strip()
+        
+        patterns = [
+            (f"{first}{last}@{domain}", "firstlast"),
+            (f"{last}{first}@{domain}", "lastfirst"),
+            (f"{first}_{last}@{domain}", "first_last"),
+            (f"{last}_{first}@{domain}", "last_first"),
+            (f"{first}.{last}@{domain}", "first.last"),
+            (f"{last}.{first}@{domain}", "last.first"),
+            (f"{first}-{last}@{domain}", "first-last"),
+            (f"{last}-{first}@{domain}", "last-first"),
+            (f"{first[0]}{last}@{domain}", "flast"),
+            (f"{first}{last[0]}@{domain}", "firstl"),
+            (f"{last[0]}{first}@{domain}", "lfirst"),
+            (f"{last}{first[0]}@{domain}", "lastf"),
+            (f"{first}@{domain}", "first"),
+            (f"{last}@{domain}", "last"),
+            (f"{first[0]}.{last}@{domain}", "f.last"),
+            (f"{first}.{last[0]}@{domain}", "first.l"),
+            (f"{last}.{first[0]}@{domain}", "last.f"),
+            (f"{last[0]}.{first}@{domain}", "l.first"),
+            (f"{first}_{last[0]}@{domain}", "first_l"),
+            (f"{last}_{first[0]}@{domain}", "last_f"),
+            (f"{first[0]}_{last}@{domain}", "f_last"),
+            (f"{last[0]}_{first}@{domain}", "l_first"),
+            (f"{last[0]}-{first}@{domain}", "l-first"),
+            (f"{first[0]}-{last}@{domain}", "f-last"),
+            (f"{first}-{last[0]}@{domain}", "first-l"),
+            (f"{last}-{first[0]}@{domain}", "last-f"),
+        ]
+        
+        return [{"email": email, "pattern": pattern} for email, pattern in patterns]
+
+
+# Global verifier
+verifier = EmailVerifier()
+
+def parse_manual_emails(text: str) -> List[str]:
+    """Parse emails from text (newline or comma separated)"""
+    if not text or not text.strip():
+        return []
+    text = text.replace(',', '\n')
+    emails = [e.strip() for e in text.split('\n') if e.strip()]
+    return emails
+
+def find_and_verify_manual(name_domain_text: str, delay: float, progress=gr.Progress()):
+    """Find and verify emails from manual name+domain input"""
+    if not name_domain_text or not name_domain_text.strip():
+        return None, "❌ Please enter at least one entry (First Name, Last Name, Domain)"
+    
+    lines = [l.strip() for l in name_domain_text.split('\n') if l.strip()]
+    
+    all_results = []
+    total_entries = len(lines)
+    
+    for entry_idx, line in enumerate(lines):
+        progress((entry_idx) / total_entries, desc=f"Processing entry {entry_idx+1}/{total_entries}")
+        
+        # Parse line: "FirstName LastName domain.com" or "FirstName,LastName,domain.com"
+        parts = re.split(r'[,\s]+', line)
+        
+        if len(parts) < 3:
+            all_results.append({
+                'First_Name': '',
+                'Last_Name': '',
+                'Domain': '',
+                'Found_Email': 'ERROR',
+                'Pattern': '',
+                'Status': 'INVALID',
+                'Deliverable': 'No',
+                'Confidence': '0%',
+                'Details': 'Invalid format - need: FirstName LastName domain.com'
+            })
+            continue
+        
+        first_name = parts[0]
+        last_name = parts[1]
+        domain = parts[2]
+        
+        # Generate patterns
+        patterns = verifier.generate_email_patterns(first_name, last_name, domain)
+        
+        found_email = None
+        best_result = None
+        
+        # Test each pattern
+        for i, pattern_info in enumerate(patterns):
+            email = pattern_info['email']
+            pattern_name = pattern_info['pattern']
+            
+            progress((entry_idx + (i / len(patterns))) / total_entries, 
+                    desc=f"Testing {email}")
+            
+            result = verifier.verify(email, check_smtp=True, check_catch_all=True)
+            
+            # If we find a valid one, stop
+            if result.smtp_verified is True:
+                found_email = email
+                best_result = result
+                break
+            
+            # Keep track of best result even if not verified
+            if best_result is None or (result.confidence_score > best_result.confidence_score):
+                found_email = email
+                best_result = result
+            
+            time.sleep(delay)
+        
+        # Add result
+        if best_result:
+            all_results.append({
+                'First_Name': first_name,
+                'Last_Name': last_name,
+                'Domain': domain,
+                'Found_Email': found_email,
+                'Pattern': pattern_name if found_email else 'N/A',
+                'Status': best_result.status,
+                'Deliverable': 'Yes' if best_result.deliverable else 'No',
+                'Confidence': f"{best_result.confidence_score}%",
+                'SMTP_Verified': 'Yes' if best_result.smtp_verified else 'No' if best_result.smtp_verified is False else 'Unknown',
+                'Disposable': 'Yes' if best_result.is_disposable else 'No',
+                'Catch_All': 'Yes' if best_result.is_catch_all else 'No' if best_result.is_catch_all is False else 'Unknown',
+                'Details': '; '.join(best_result.details)
+            })
+    
+    df = pd.DataFrame(all_results)
+    
+    found = sum(1 for r in all_results if r.get('SMTP_Verified') == 'Yes')
+    
+    summary = f"""
+✅ Email Finding Complete!
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Results: {total_entries} people processed
+🎯 Found: {found} verified emails
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+Download the CSV file below ⬇️
+"""
+    
+    return df, summary
+
+def verify_manual_emails(email_text: str, delay: float, progress=gr.Progress()):
+    """Verify manually entered emails"""
+    if not email_text or not email_text.strip():
+        return None, "❌ Please enter at least one email address"
+    
+    emails = parse_manual_emails(email_text)
+    
+    if not emails:
+        return None, "❌ No valid emails found in input"
+    
+    results = []
+    total = len(emails)
+    
+    progress(0, desc="Starting verification...")
+    
+    for i, email in enumerate(emails):
+        progress((i + 1) / total, desc=f"Verifying {i+1}/{total}: {email}")
+        result = verifier.verify(email, check_smtp=True, check_catch_all=True)
+        
+        results.append({
+            'Email': result.email,
+            'Status': result.status,
+            'Deliverable': 'Yes' if result.deliverable else 'No',
+            'Confidence': f"{result.confidence_score}%",
+            'SMTP_Verified': 'Yes' if result.smtp_verified else 'No' if result.smtp_verified is False else 'Unknown',
+            'Disposable': 'Yes' if result.is_disposable else 'No',
+            'Role_Based': 'Yes' if result.is_role_based else 'No',
+            'Free_Provider': 'Yes' if result.is_free_provider else 'No',
+            'Catch_All': 'Yes' if result.is_catch_all else 'No' if result.is_catch_all is False else 'Unknown',
+            'Details': '; '.join(result.details)
+        })
+        
+        if i < total - 1 and delay > 0:
+            time.sleep(delay)
+    
+    df = pd.DataFrame(results)
+    
+    valid = sum(1 for r in results if r['Status'] == 'VALID')
+    invalid = sum(1 for r in results if r['Status'] == 'INVALID')
+    risky = sum(1 for r in results if r['Status'] == 'RISKY')
+    
+    summary = f"""
+✅ Verification Complete!
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Results: {total} emails processed
+
+Status Breakdown:
+  ✅ Valid:   {valid} ({valid/total*100:.1f}%)
+  ❌ Invalid: {invalid} ({invalid/total*100:.1f}%)
+  ⚠️  Risky:   {risky} ({risky/total*100:.1f}%)
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+Download the CSV file below ⬇️
+"""
+    
+    return df, summary
+
+def find_and_verify_csv(file, name_mode: str, full_name_col: str, first_col: str, last_col: str, 
+                       domain_col: str, export_mode: str, delay: float, progress=gr.Progress()):
+    """Find and verify emails from CSV with name columns"""
+    if file is None:
+        return None, None, None, "❌ Please upload a CSV file"
+    
+    try:
+        df = pd.read_csv(file.name)
+        
+        # Check columns based on mode
+        if name_mode == "Full Name (one column)":
+            if full_name_col not in df.columns:
+                available = ', '.join(df.columns.tolist())
+                return None, None, None, f"❌ Column '{full_name_col}' not found. Available: {available}"
+        else:  # Separate columns
+            missing = []
+            if first_col not in df.columns:
+                missing.append(first_col)
+            if last_col not in df.columns:
+                missing.append(last_col)
+            
+            if missing:
+                available = ', '.join(df.columns.tolist())
+                return None, None, None, f"❌ Columns not found: {', '.join(missing)}. Available: {available}"
+        
+        if domain_col not in df.columns:
+            available = ', '.join(df.columns.tolist())
+            return None, None, None, f"❌ Column '{domain_col}' not found. Available: {available}"
+        
+        total = len(df)
+        results_data = []
+        
+        for idx, row in df.iterrows():
+            progress((idx + 1) / total, desc=f"Processing {idx+1}/{total}")
+            
+            # Parse names based on mode
+            if name_mode == "Full Name (one column)":
+                full_name = str(row[full_name_col]).strip()
+                if not full_name or full_name == 'nan':
+                    results_data.append({
+                        'Found_Email': 'ERROR',
+                        'Pattern': '',
+                        'Status': 'INVALID',
+                        'Deliverable': 'No',
+                        'Confidence': '0%',
+                        'SMTP_Verified': 'No',
+                        'Disposable': 'No',
+                        'Catch_All': 'Unknown',
+                        'Details': 'Missing name'
+                    })
+                    continue
+                
+                # Split by space
+                name_parts = full_name.split()
+                if len(name_parts) < 2:
+                    results_data.append({
+                        'Found_Email': 'ERROR',
+                        'Pattern': '',
+                        'Status': 'INVALID',
+                        'Deliverable': 'No',
+                        'Confidence': '0%',
+                        'SMTP_Verified': 'No',
+                        'Disposable': 'No',
+                        'Catch_All': 'Unknown',
+                        'Details': 'Name must have at least first and last (space-separated)'
+                    })
+                    continue
+                
+                first_name = name_parts[0]
+                last_name = name_parts[-1]  # Take last part as last name
+            else:
+                first_name = str(row[first_col]).strip()
+                last_name = str(row[last_col]).strip()
+            
+            domain = str(row[domain_col]).strip()
+            
+            if not first_name or not last_name or not domain or first_name == 'nan' or last_name == 'nan' or domain == 'nan':
+                results_data.append({
+                    'Found_Email': 'ERROR',
+                    'Pattern': '',
+                    'Status': 'INVALID',
+                    'Deliverable': 'No',
+                    'Confidence': '0%',
+                    'SMTP_Verified': 'No',
+                    'Disposable': 'No',
+                    'Catch_All': 'Unknown',
+                    'Details': 'Missing name or domain'
+                })
+                continue
+            
+            patterns = verifier.generate_email_patterns(first_name, last_name, domain)
+            
+            found_email = None
+            best_result = None
+            pattern_name = ''
+            
+            for pattern_info in patterns:
+                email = pattern_info['email']
+                pattern_name = pattern_info['pattern']
+                
+                result = verifier.verify(email, check_smtp=True, check_catch_all=True)
+                
+                if result.smtp_verified is True:
+                    found_email = email
+                    best_result = result
+                    break
+                
+                if best_result is None or (result.confidence_score > best_result.confidence_score):
+                    found_email = email
+                    best_result = result
+                
+                time.sleep(delay)
+            
+            if best_result:
+                results_data.append({
+                    'Found_Email': found_email,
+                    'Pattern': pattern_name,
+                    'Status': best_result.status,
+                    'Deliverable': 'Yes' if best_result.deliverable else 'No',
+                    'Confidence': f"{best_result.confidence_score}%",
+                    'SMTP_Verified': 'Yes' if best_result.smtp_verified else 'No' if best_result.smtp_verified is False else 'Unknown',
+                    'Disposable': 'Yes' if best_result.is_disposable else 'No',
+                    'Catch_All': 'Yes' if best_result.is_catch_all else 'No' if best_result.is_catch_all is False else 'Unknown',
+                    'Details': '; '.join(best_result.details)
+                })
+        
+        results_df = pd.DataFrame(results_data)
+        final_df = pd.concat([df, results_df], axis=1)
+        
+        found = sum(1 for r in results_data if r.get('SMTP_Verified') == 'Yes')
+        
+        # Create filtered versions based on export mode
+        filtered_valid_with_catchall = None
+        filtered_valid_no_catchall = None
+        
+        if export_mode in ["Valid Only (including catch-all)", "All Options"]:
+            # Filter: Valid + Risky (catch-all)
+            mask = final_df['Status'].isin(['VALID', 'RISKY'])
+            filtered_valid_with_catchall = final_df[mask].copy()
+        
+        if export_mode in ["Valid Only (excluding catch-all)", "All Options"]:
+            # Filter: Valid only (no catch-all, no risky)
+            mask = (final_df['Status'] == 'VALID') & (final_df['Catch_All'] != 'Yes')
+            filtered_valid_no_catchall = final_df[mask].copy()
+        
+        summary = f"""
+✅ Email Finding Complete!
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Results: {total} people processed
+🎯 Found: {found} verified emails
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+Download your files below ⬇️
+"""
+        
+        return final_df, filtered_valid_with_catchall, filtered_valid_no_catchall, summary
+        
+    except Exception as e:
+        return None, None, None, f"❌ Error: {str(e)}"
+
+def verify_csv_upload(file, email_column: str, export_mode: str, delay: float, progress=gr.Progress()):
+    """Verify emails from uploaded CSV"""
+    if file is None:
+        return None, None, None, "❌ Please upload a CSV file"
+    
+    try:
+        df = pd.read_csv(file.name)
+        
+        if email_column not in df.columns:
+            available_cols = ', '.join(df.columns.tolist())
+            return None, None, None, f"❌ Column '{email_column}' not found. Available: {available_cols}"
+        
+        emails = df[email_column].dropna().astype(str).tolist()
+        
+        if not emails:
+            return None, None, None, f"❌ No emails found in column '{email_column}'"
+        
+        total = len(emails)
+        progress(0, desc="Starting verification...")
+        
+        results_data = []
+        for i, email in enumerate(emails):
+            progress((i + 1) / total, desc=f"Verifying {i+1}/{total}: {email}")
+            result = verifier.verify(email, check_smtp=True, check_catch_all=True)
+            
+            results_data.append({
+                'Status': result.status,
+                'Deliverable': 'Yes' if result.deliverable else 'No',
+                'Confidence': f"{result.confidence_score}%",
+                'SMTP_Verified': 'Yes' if result.smtp_verified else 'No' if result.smtp_verified is False else 'Unknown',
+                'Disposable': 'Yes' if result.is_disposable else 'No',
+                'Role_Based': 'Yes' if result.is_role_based else 'No',
+                'Free_Provider': 'Yes' if result.is_free_provider else 'No',
+                'Catch_All': 'Yes' if result.is_catch_all else 'No' if result.is_catch_all is False else 'Unknown',
+                'Details': '; '.join(result.details)
+            })
+            
+            if i < total - 1 and delay > 0:
+                time.sleep(delay)
+        
+        results_df = pd.DataFrame(results_data)
+        final_df = pd.concat([df, results_df], axis=1)
+        
+        # Create filtered versions
+        filtered_valid_with_catchall = None
+        filtered_valid_no_catchall = None
+        
+        if export_mode in ["Valid Only (including catch-all)", "All Options"]:
+            mask = final_df['Status'].isin(['VALID', 'RISKY'])
+            filtered_valid_with_catchall = final_df[mask].copy()
+        
+        if export_mode in ["Valid Only (excluding catch-all)", "All Options"]:
+            mask = (final_df['Status'] == 'VALID') & (final_df['Catch_All'] != 'Yes')
+            filtered_valid_no_catchall = final_df[mask].copy()
+        
+        valid = sum(1 for r in results_data if r['Status'] == 'VALID')
+        invalid = sum(1 for r in results_data if r['Status'] == 'INVALID')
+        risky = sum(1 for r in results_data if r['Status'] == 'RISKY')
+        
+        summary = f"""
+✅ Verification Complete!
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📊 Results: {total} emails processed
+
+Status Breakdown:
+  ✅ Valid:   {valid} ({valid/total*100:.1f}%)
+  ❌ Invalid: {invalid} ({invalid/total*100:.1f}%)
+  ⚠️  Risky:   {risky} ({risky/total*100:.1f}%)
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+Download your files below ⬇️
+"""
+        
+        return final_df, filtered_valid_with_catchall, filtered_valid_no_catchall, summary
+        
+    except Exception as e:
+        return None, None, None, f"❌ Error: {str(e)}"
+
+
+# Gradio Interface
+with gr.Blocks(title="Email Verification & Finder Tool", theme=gr.themes.Soft()) as demo:
+    gr.Markdown("""
+    # 📧 Professional Email Verification & Finder Tool
+    ### Find and verify email addresses with SMTP validation!
+    """)
+    
+    with gr.Tabs():
+        # Tab 1: Verify Existing Emails - Manual
+        with gr.Tab("✅ Verify Emails - Manual"):
+            gr.Markdown("""
+            ### Enter emails to verify (one per line or comma-separated)
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    verify_manual_input = gr.Textbox(
+                        label="Email Addresses",
+                        placeholder="user1@gmail.com\nuser2@yahoo.com\nuser3@example.com",
+                        lines=10
+                    )
+                
+                with gr.Column(scale=1):
+                    verify_manual_delay = gr.Slider(
+                        minimum=0, maximum=5, step=0.5, value=1.0,
+                        label="Delay Between Checks (seconds)"
+                    )
+                    verify_manual_btn = gr.Button("🚀 Verify Emails", variant="primary", size="lg")
+            
+            verify_manual_status = gr.Textbox(label="Status", lines=8)
+            verify_manual_output = gr.DataFrame(label="Results", wrap=True)
+            verify_manual_download = gr.File(label="📥 Download CSV", interactive=False)
+            
+            def process_verify_manual(text, delay):
+                df, status = verify_manual_emails(text, delay)
+                if df is not None:
+                    csv_path = "/tmp/verification_results.csv"
+                    df.to_csv(csv_path, index=False)
+                    return status, df, csv_path
+                return status, None, None
+            
+            verify_manual_btn.click(
+                fn=process_verify_manual,
+                inputs=[verify_manual_input, verify_manual_delay],
+                outputs=[verify_manual_status, verify_manual_output, verify_manual_download]
+            )
+        
+        # Tab 2: Verify Existing Emails - CSV
+        with gr.Tab("✅ Verify Emails - CSV"):
+            gr.Markdown("""
+            ### Upload CSV with existing emails to verify
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    verify_csv_file = gr.File(label="Upload CSV File", file_types=[".csv"])
+                    verify_csv_column = gr.Textbox(
+                        label="Email Column Name",
+                        placeholder="email",
+                        value="email"
+                    )
+                    verify_csv_export = gr.Radio(
+                        choices=["Full Results", "Valid Only (including catch-all)", "Valid Only (excluding catch-all)", "All Options"],
+                        value="Full Results",
+                        label="Export Options"
+                    )
+                
+                with gr.Column(scale=1):
+                    verify_csv_delay = gr.Slider(
+                        minimum=0, maximum=5, step=0.5, value=1.0,
+                        label="Delay Between Checks (seconds)"
+                    )
+                    verify_csv_btn = gr.Button("🚀 Verify Emails", variant="primary", size="lg")
+            
+            verify_csv_status = gr.Textbox(label="Status", lines=8)
+            verify_csv_output = gr.DataFrame(label="Full Results", wrap=True)
+            verify_csv_download_full = gr.File(label="📥 Download Full Results CSV", interactive=False)
+            verify_csv_download_valid_with = gr.File(label="📥 Download Valid (with catch-all) CSV", interactive=False, visible=False)
+            verify_csv_download_valid_no = gr.File(label="📥 Download Valid (no catch-all) CSV", interactive=False, visible=False)
+            
+            def process_verify_csv(file, column, export_mode, delay):
+                df_full, df_valid_with, df_valid_no, status = verify_csv_upload(file, column, export_mode, delay)
+                
+                if df_full is None:
+                    return status, None, None, None, None, gr.update(visible=False), gr.update(visible=False)
+                
+                # Save CSVs
+                csv_full = "/tmp/verification_full.csv"
+                df_full.to_csv(csv_full, index=False)
+                
+                csv_valid_with = None
+                csv_valid_no = None
+                show_valid_with = False
+                show_valid_no = False
+                
+                if df_valid_with is not None:
+                    csv_valid_with = "/tmp/verification_valid_with_catchall.csv"
+                    df_valid_with.to_csv(csv_valid_with, index=False)
+                    show_valid_with = True
+                
+                if df_valid_no is not None:
+                    csv_valid_no = "/tmp/verification_valid_no_catchall.csv"
+                    df_valid_no.to_csv(csv_valid_no, index=False)
+                    show_valid_no = True
+                
+                return (status, df_full, csv_full, csv_valid_with, csv_valid_no,
+                       gr.update(visible=show_valid_with), gr.update(visible=show_valid_no))
+            
+            verify_csv_btn.click(
+                fn=process_verify_csv,
+                inputs=[verify_csv_file, verify_csv_column, verify_csv_export, verify_csv_delay],
+                outputs=[verify_csv_status, verify_csv_output, verify_csv_download_full, 
+                        verify_csv_download_valid_with, verify_csv_download_valid_no,
+                        verify_csv_download_valid_with, verify_csv_download_valid_no]
+            )
+        
+        # Tab 3: Find Emails - Manual
+        with gr.Tab("🔍 Find Emails - Manual"):
+            gr.Markdown("""
+            ### Find email addresses from names and domains
+            Enter one person per line: `FirstName LastName domain.com`
+            
+            Example:
+            ```
+            John Doe acme.com
+            Jane Smith techcorp.io
+            Bob Johnson startup.co
+            ```
+            
+            The tool will test **26 different email patterns** and find the correct one!
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    find_manual_input = gr.Textbox(
+                        label="Names and Domains",
+                        placeholder="John Doe acme.com\nJane Smith techcorp.io\nBob Johnson startup.co",
+                        lines=10
+                    )
+                
+                with gr.Column(scale=1):
+                    find_manual_delay = gr.Slider(
+                        minimum=0.5, maximum=5, step=0.5, value=1.0,
+                        label="Delay Between Checks (seconds)"
+                    )
+                    find_manual_btn = gr.Button("🔍 Find Emails", variant="primary", size="lg")
+            
+            find_manual_status = gr.Textbox(label="Status", lines=8)
+            find_manual_output = gr.DataFrame(label="Results", wrap=True)
+            find_manual_download = gr.File(label="📥 Download CSV", interactive=False)
+            
+            def process_find_manual(text, delay):
+                df, status = find_and_verify_manual(text, delay)
+                if df is not None:
+                    csv_path = "/tmp/found_emails_manual.csv"
+                    df.to_csv(csv_path, index=False)
+                    return status, df, csv_path
+                return status, None, None
+            
+            find_manual_btn.click(
+                fn=process_find_manual,
+                inputs=[find_manual_input, find_manual_delay],
+                outputs=[find_manual_status, find_manual_output, find_manual_download]
+            )
+        
+        # Tab 4: Find Emails - CSV
+        with gr.Tab("🔍 Find Emails - CSV"):
+            gr.Markdown("""
+            ### Upload CSV with names and domains to find emails
+            Choose between:
+            - **Full Name (one column)**: Name column with "First Last" format
+            - **Separate Columns**: One column for first name, one for last name
+            
+            The tool will test **26 different email patterns** for each person!
+            """)
+            
+            with gr.Row():
+                with gr.Column(scale=2):
+                    find_csv_file = gr.File(label="Upload CSV File", file_types=[".csv"])
+                    
+                    find_csv_name_mode = gr.Radio(
+                        choices=["Full Name (one column)", "Separate Columns (first + last)"],
+                        value="Separate Columns (first + last)",
+                        label="Name Format"
+                    )
+                    
+                    # Full name mode
+                    with gr.Group(visible=False) as find_csv_fullname_group:
+                        find_csv_fullname = gr.Textbox(
+                            label="Full Name Column",
+                            placeholder="name",
+                            value="name"
+                        )
+                    
+                    # Separate columns mode
+                    with gr.Group(visible=True) as find_csv_separate_group:
+                        with gr.Row():
+                            find_csv_first = gr.Textbox(
+                                label="First Name Column",
+                                placeholder="first_name",
+                                value="first_name"
+                            )
+                            find_csv_last = gr.Textbox(
+                                label="Last Name Column",
+                                placeholder="last_name",
+                                value="last_name"
+                            )
+                    
+                    find_csv_domain = gr.Textbox(
+                        label="Domain Column",
+                        placeholder="domain",
+                        value="domain"
+                    )
+                    
+                    find_csv_export = gr.Radio(
+                        choices=["Full Results", "Valid Only (including catch-all)", "Valid Only (excluding catch-all)", "All Options"],
+                        value="Full Results",
+                        label="Export Options"
+                    )
+                
+                with gr.Column(scale=1):
+                    find_csv_delay = gr.Slider(
+                        minimum=0.5, maximum=5, step=0.5, value=1.0,
+                        label="Delay Between Checks (seconds)"
+                    )
+                    find_csv_btn = gr.Button("🔍 Find Emails", variant="primary", size="lg")
+            
+            find_csv_status = gr.Textbox(label="Status", lines=8)
+            find_csv_output = gr.DataFrame(label="Full Results", wrap=True)
+            find_csv_download_full = gr.File(label="📥 Download Full Results CSV", interactive=False)
+            find_csv_download_valid_with = gr.File(label="📥 Download Valid (with catch-all) CSV", interactive=False, visible=False)
+            find_csv_download_valid_no = gr.File(label="📥 Download Valid (no catch-all) CSV", interactive=False, visible=False)
+            
+            # Toggle visibility based on name mode selection
+            def toggle_name_mode(mode):
+                if mode == "Full Name (one column)":
+                    return gr.update(visible=True), gr.update(visible=False)
+                else:
+                    return gr.update(visible=False), gr.update(visible=True)
+            
+            find_csv_name_mode.change(
+                fn=toggle_name_mode,
+                inputs=[find_csv_name_mode],
+                outputs=[find_csv_fullname_group, find_csv_separate_group]
+            )
+            
+            def process_find_csv(file, name_mode, fullname_col, first_col, last_col, domain_col, export_mode, delay):
+                df_full, df_valid_with, df_valid_no, status = find_and_verify_csv(
+                    file, name_mode, fullname_col, first_col, last_col, domain_col, export_mode, delay
+                )
+                
+                if df_full is None:
+                    return status, None, None, None, None, gr.update(visible=False), gr.update(visible=False)
+                
+                # Save CSVs
+                csv_full = "/tmp/found_emails_full.csv"
+                df_full.to_csv(csv_full, index=False)
+                
+                csv_valid_with = None
+                csv_valid_no = None
+                show_valid_with = False
+                show_valid_no = False
+                
+                if df_valid_with is not None:
+                    csv_valid_with = "/tmp/found_emails_valid_with_catchall.csv"
+                    df_valid_with.to_csv(csv_valid_with, index=False)
+                    show_valid_with = True
+                
+                if df_valid_no is not None:
+                    csv_valid_no = "/tmp/found_emails_valid_no_catchall.csv"
+                    df_valid_no.to_csv(csv_valid_no, index=False)
+                    show_valid_no = True
+                
+                return (status, df_full, csv_full, csv_valid_with, csv_valid_no,
+                       gr.update(visible=show_valid_with), gr.update(visible=show_valid_no))
+            
+            find_csv_btn.click(
+                fn=process_find_csv,
+                inputs=[find_csv_file, find_csv_name_mode, find_csv_fullname, find_csv_first, 
+                       find_csv_last, find_csv_domain, find_csv_export, find_csv_delay],
+                outputs=[find_csv_status, find_csv_output, find_csv_download_full,
+                        find_csv_download_valid_with, find_csv_download_valid_no,
+                        find_csv_download_valid_with, find_csv_download_valid_no]
+            )
+    
+    gr.Markdown("""
+    ---
+    ### 📋 Email Patterns Tested (26 total):
+    `firstlast@`, `lastfirst@`, `first_last@`, `last_first@`, `first.last@`, `last.first@`, 
+    `first-last@`, `last-first@`, `flast@`, `firstl@`, `lfirst@`, `lastf@`, `first@`, `last@`,
+    `f.last@`, `first.l@`, `last.f@`, `l.first@`, `first_l@`, `last_f@`, `f_last@`, `l_first@`,
+    `l-first@`, `f-last@`, `first-l@`, `last-f@`
+    
+    ### 📊 Export Options:
+    - **Full Results**: Complete CSV with all verification data
+    - **Valid Only (including catch-all)**: Only VALID + RISKY (catch-all) rows
+    - **Valid Only (excluding catch-all)**: Only VALID rows (no catch-all domains)
+    - **All Options**: Get all 3 CSV files at once
+    
+    ### 📊 Result Columns:
+    - **Status**: VALID ✅ / INVALID ❌ / RISKY ⚠️ / UNKNOWN ❓
+    - **Deliverable**: Can you send emails to this address?
+    - **Confidence**: 0-100% confidence score (higher is better)
+    - **SMTP_Verified**: Mailbox verified via SMTP server
+    - **Pattern**: Which email format was found (for Find Email mode)
+    - **Catch_All**: Domain accepts all emails (can't verify specific mailbox)
+    
+    ### 💡 Tips:
+    - **Verify Mode**: Check if existing emails are valid
+    - **Find Mode**: Discover email addresses from names + domains
+    - Use 1-2 second delay to avoid rate limiting
+    - Finding emails tests 26 patterns so it takes longer
+    - **Name Format Options**:
+      - "John Doe" in one column → Use "Full Name (one column)"
+      - "John" and "Doe" in separate columns → Use "Separate Columns"
+    - **Export filtered CSVs** to clean your lists automatically
+    
+    ### ⚡ Performance:
+    - Verification: ~2-3 seconds per email
+    - Finding: ~30-60 seconds per person (tests 26 patterns)
+    - Use delays to prevent server blocks
+    """)
+
+# Launch
+if __name__ == "__main__":
+    print("=" * 70)
+    print("EMAIL VERIFICATION & FINDER TOOL")
+    print("=" * 70)
+    print("\n📦 Installing required packages...")
+    print("Run: !pip install gradio dnspython pandas")
+    print("\n🚀 Launching tool...")
+    print("\nFeatures:")
+    print("  ✅ Verify existing emails (manual or CSV)")
+    print("  🔍 Find emails from names (tests 26 patterns!)")
+    print("  📊 SMTP verification always ON")
+    print("  🎯 Catch-all detection always ON")
+    print("=" * 70)
+    demo.launch(share=True)
